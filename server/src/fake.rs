@@ -354,6 +354,7 @@ fn make_day(
                 connected: true,
             },
             marks,
+            parts: 1,
         });
         freezes += 1;
         prev_layout = l.0.to_string();

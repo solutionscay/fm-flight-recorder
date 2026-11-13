@@ -183,9 +183,11 @@ pub fn to_row(i: usize, v: &Value, session_id: &str, fallback_ms: i64) -> Result
             after,
             net,
             marks,
+            parts,
             ..
         } => {
             let a = after.clone().unwrap_or_default();
+            row.parts = *parts;
             row.duration_ms = *duration_ms;
             row.level = level.clone();
             row.net = *net;
@@ -350,9 +352,9 @@ pub fn store_batch(db: &mut Db, b: &Batch, m: Meta) -> Result<IngestReply, Store
             "INSERT OR IGNORE INTO events(session_id, seq, client_id, type, ts_ms, end_ms,
                duration_ms, wait_ms, round_trips, srtt_ms, tx_bytes, rx_bytes, tx_packets,
                rx_packets, connected, level, file, layout, layout_table, from_layout, script,
-               account, user, label, marks, before_json, after_json, raw)
+               account, user, label, marks, before_json, after_json, raw, parts)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
-               ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28)",
+               ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29)",
         )?;
         for r in &rows {
             // A long freeze: one row that grows, then the final replaces it.
@@ -415,6 +417,7 @@ pub fn store_batch(db: &mut Db, b: &Batch, m: Meta) -> Result<IngestReply, Store
                     .map(|c| serde_json::to_string(c).unwrap())
                     .unwrap_or_default(),
                 r.raw,
+                r.parts as i64,
             ])?;
             if added == 0 {
                 reply.duplicates += 1;
@@ -577,7 +580,8 @@ fn replace_open(
            round_trips = ?6, srtt_ms = ?7, tx_bytes = ?8, rx_bytes = ?9, tx_packets = ?10,
            rx_packets = ?11, connected = ?12, level = ?13, file = ?14, layout = ?15,
            layout_table = ?16, from_layout = ?17, script = ?18, account = ?19, user = ?20,
-           marks = ?21, before_json = ?22, after_json = ?23, raw = ?24
+           marks = ?21, before_json = ?22, after_json = ?23, raw = ?24,
+           parts = MAX(parts, ?25)
          WHERE id = ?1",
         params![
             id,
@@ -610,6 +614,7 @@ fn replace_open(
                 .map(|c| serde_json::to_string(c).unwrap())
                 .unwrap_or_default(),
             r.raw,
+            r.parts as i64,
         ],
     )?;
     tx.execute(

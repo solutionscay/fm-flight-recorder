@@ -250,7 +250,7 @@ impl Default for Config {
             heartbeat: "idle".into(),
             app: String::new(),
             after_wait_ms: 1500,
-            join_ms: 50,
+            join_ms: crate::detector::JOIN_MS,
             progress_ms: 1000,
             endpoint: None,
             token: String::new(),
@@ -1086,10 +1086,13 @@ fn watchdog(
                     &s,
                 ),
                 JoinOut::Close {
-                    start_ns, end_ns, ..
+                    start_ns,
+                    end_ns,
+                    parts,
+                    ..
                 } => {
                     s.stall_since_ns.store(0, Release);
-                    let ev = final_freeze(
+                    let mut ev = final_freeze(
                         &cfg,
                         &inner,
                         &net,
@@ -1099,6 +1102,7 @@ fn watchdog(
                         level_before_stall,
                         std::mem::take(&mut ctx_before_stall),
                     );
+                    set_parts(&mut ev, parts);
                     close_freeze(&cfg, &inner, &s, &tx, ev, end_ns);
                 }
             }
@@ -1141,10 +1145,13 @@ fn watchdog(
     // At stop: a freeze whose last part ended but did not settle yet. The
     // "after" queue is already flushed, so send it now.
     if let Some(JoinOut::Close {
-        start_ns, end_ns, ..
+        start_ns,
+        end_ns,
+        parts,
+        ..
     }) = joiner.flush()
     {
-        let ev = final_freeze(
+        let mut ev = final_freeze(
             &cfg,
             &inner,
             &net,
@@ -1154,7 +1161,14 @@ fn watchdog(
             level_before_stall,
             ctx_before_stall,
         );
+        set_parts(&mut ev, parts);
         close_freeze(&cfg, &inner, &s, &tx, ev, end_ns);
+    }
+}
+
+fn set_parts(ev: &mut Event, n: u32) {
+    if let Event::Freeze { parts, .. } = ev {
+        *parts = n;
     }
 }
 
@@ -1235,6 +1249,7 @@ fn final_freeze(
         after: None,
         net: netw,
         marks,
+        parts: 1,
     }
 }
 

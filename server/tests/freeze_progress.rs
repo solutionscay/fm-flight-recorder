@@ -97,6 +97,8 @@ fn progress_makes_one_open_row_that_grows_and_the_final_replaces_it() {
     assert_eq!((r.accepted, r.duplicates), (1, 0));
     assert_eq!(row(&db), (1, 0, 6, 7448));
     assert_eq!(one(&db, "SELECT wait_ms FROM events"), 400);
+    // A final with no `parts` (older plug-in) keeps the parts of the progress.
+    assert_eq!(one(&db, "SELECT parts FROM events"), 3);
     assert_eq!(one(&db, "SELECT freezes FROM sessions"), 1);
     assert_eq!(one(&db, "SELECT frozen_ms FROM sessions"), 7448);
 
@@ -218,4 +220,24 @@ fn the_pages_show_an_ongoing_freeze_then_the_final_row() {
         let p = get(&base, path);
         assert!(!p.body.contains(">ongoing<"), "{path}: still ongoing");
     }
+}
+
+#[test]
+fn the_parts_of_the_final_freeze_are_stored() {
+    let mut db = db::open_memory();
+    put(&mut db, vec![progress(3, 1000, 2)]);
+    let mut f = final_freeze(4, 7448);
+    f["parts"] = json!(7);
+    put(&mut db, vec![f]);
+    assert_eq!(one(&db, "SELECT parts FROM events"), 7);
+
+    // A freeze with no progress row: the plain insert stores its parts too.
+    let mut db = db::open_memory();
+    let mut f = final_freeze(4, 300);
+    f["parts"] = json!(1);
+    put(&mut db, vec![f]);
+    assert_eq!(
+        one(&db, "SELECT parts FROM events WHERE type = 'freeze'"),
+        1
+    );
 }

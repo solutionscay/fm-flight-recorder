@@ -191,6 +191,7 @@ fn main() {
                 connected: true,
             },
             marks: vec![],
+            parts: 1,
         });
         freezes += 1;
         prev_layout = layout.to_string();

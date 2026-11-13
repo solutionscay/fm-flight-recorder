@@ -203,19 +203,27 @@ struct OpenFreeze {
     end_ns: Option<u64>,
     parts: u32,
     last_progress_ns: u64,
+    /// Since when the run loop sleeps, after the last part ended.
+    slept_since: Option<u64>,
 }
+
+/// Default join window, ms. FileMaker can pump events for 50-220 ms
+/// between the steps of a long script (log of 2026-11-13), so 50 ms is too
+/// short. A user pause is longer.
+pub const JOIN_MS: u64 = 300;
 
 /// Joins the parts of one long wait into one freeze.
 ///
 /// FileMaker can run the run loop for a moment in a long operation (about
 /// once a second in a long script step). Each run is a beat, so the
 /// [`StallDetector`] sees parts of about 1 s with no gap between them. A
-/// part that starts at most `join` after the end of the last part, with no
-/// real sleep between, is the same freeze.
+/// part that starts at most `join` after the end of the last part is the
+/// same freeze. A sleep of the run loop that is shorter than `join` does
+/// not split it: FileMaker can sleep for a moment between script steps.
 ///
 /// The decision comes late: a new part is known only `threshold` after it
 /// starts. So a freeze closes `join + threshold` (plus 2 polls) after its
-/// last part, or at once when the run loop really sleeps.
+/// last part, or when the run loop has slept for `join` (an idle UI).
 #[derive(Debug, Clone)]
 pub struct Joiner {
     join_ns: u64,
@@ -242,7 +250,8 @@ impl Joiner {
     }
 
     /// Feed the detector's transition (if any) of this poll. `slept` is
-    /// true when the run loop really sleeps now.
+    /// true when the run loop really sleeps now. With `join` = 0, a sleep
+    /// closes the freeze at once.
     pub fn step(&mut self, now_ns: u64, t: Option<Transition>, slept: bool) -> Vec<JoinOut> {
         let mut out = Vec::new();
         match t {
@@ -263,6 +272,7 @@ impl Joiner {
                         end_ns: None,
                         parts: 1,
                         last_progress_ns: start_ns,
+                        slept_since: None,
                     });
                     out.push(JoinOut::Open { id, start_ns });
                 }
@@ -270,9 +280,7 @@ impl Joiner {
             Some(Transition::Ended { end_ns, .. }) => {
                 if let Some(o) = &mut self.open {
                     o.end_ns = Some(end_ns.max(o.start_ns));
-                    if slept {
-                        out.extend(self.close());
-                    }
+                    o.slept_since = None;
                 }
             }
             None => {}
@@ -280,7 +288,15 @@ impl Joiner {
         if let Some(o) = &mut self.open {
             match o.end_ns {
                 Some(e) => {
-                    if now_ns >= e + self.settle_ns {
+                    o.slept_since = if slept {
+                        Some(o.slept_since.unwrap_or(now_ns))
+                    } else {
+                        None
+                    };
+                    let idle = o
+                        .slept_since
+                        .is_some_and(|t| now_ns.saturating_sub(t) >= self.join_ns);
+                    if idle || now_ns >= e + self.settle_ns {
                         out.extend(self.close());
                     }
                 }
@@ -503,8 +519,17 @@ mod tests {
     /// Run the detector and the joiner on beats at `beats_ms` (and "asleep"
     /// from `sleep_from_ms`), polling every 10 ms up to `until_ms`.
     fn join_run(beats_ms: &[u64], sleep_from_ms: u64, until_ms: u64) -> Vec<JoinOut> {
+        join_run_with(JOIN_MS, beats_ms, sleep_from_ms, until_ms)
+    }
+
+    fn join_run_with(
+        join_ms: u64,
+        beats_ms: &[u64],
+        sleep_from_ms: u64,
+        until_ms: u64,
+    ) -> Vec<JoinOut> {
         let mut d = StallDetector::new(250);
-        let mut j = Joiner::new(50, 250, 10, 1000);
+        let mut j = Joiner::new(join_ms, 250, 10, 1000);
         let mut out = Vec::new();
         for t in (0..=until_ms).step_by(10) {
             let beat = beats_ms
@@ -566,13 +591,100 @@ mod tests {
         );
     }
 
+    fn closes(out: &[JoinOut]) -> Vec<(u64, u64, u64, u32)> {
+        out.iter()
+            .filter_map(|o| match o {
+                JoinOut::Close {
+                    id,
+                    start_ns,
+                    end_ns,
+                    parts,
+                } => Some((*id, start_ns / MS, end_ns / MS, *parts)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Busy `parts` (start, end) ms, as in the log of 2026-11-13 18:15
+    /// (`Income statements - month over month - collect data`). Between the
+    /// parts FileMaker beats every ms; if `sleep_in_gaps`, the run loop
+    /// also sleeps there. The run loop sleeps after the last part.
+    fn replay(parts: &[(u64, u64)], sleep_in_gaps: bool) -> Vec<JoinOut> {
+        let mut d = StallDetector::new(250);
+        let mut j = Joiner::new(JOIN_MS, 250, 10, 1000);
+        let last_end = parts.last().unwrap().1;
+        let busy = |t: u64| parts.iter().any(|&(a, b)| t > a && t < b);
+        let mut beat = 0;
+        let mut out = Vec::new();
+        for t in 0..=last_end + 2_000 {
+            if !busy(t) {
+                beat = t;
+            }
+            if t % 10 != 0 {
+                continue;
+            }
+            let waiting = t >= last_end + 100 || (sleep_in_gaps && !busy(t) && t > parts[0].0);
+            let tr = d.observe(s(t, beat, waiting));
+            out.extend(j.step(t * MS, tr, waiting));
+        }
+        out
+    }
+
+    /// The parts of the log: durations and the gaps (56-214 ms) between them.
+    fn logged_parts() -> Vec<(u64, u64)> {
+        let durations = [1_855, 1_846, 1_876, 1_934, 1_957, 3_966, 1_939];
+        let gaps = [214, 159, 165, 132, 75, 56, 64];
+        let mut t = 1_000;
+        let mut v = Vec::new();
+        for (d, g) in durations.iter().zip(gaps) {
+            v.push((t, t + d));
+            t += d + g;
+        }
+        v
+    }
+
+    #[test]
+    fn logged_script_gaps_make_one_freeze() {
+        let parts = logged_parts();
+        let (start, end) = (parts[0].0, parts.last().unwrap().1);
+        let got = closes(&replay(&parts, false));
+        assert_eq!(got.len(), 1, "{got:?}");
+        let (id, s0, e0, n) = got[0];
+        // The end is the beat seen at the next poll (10 ms).
+        assert_eq!((id, s0, n), (1, start, 7));
+        assert!((end..=end + 10).contains(&e0), "{got:?}");
+    }
+
+    #[test]
+    fn a_short_sleep_between_script_steps_does_not_split() {
+        let parts = logged_parts();
+        let (start, end) = (parts[0].0, parts.last().unwrap().1);
+        let got = closes(&replay(&parts, true));
+        assert_eq!(got.len(), 1, "{got:?}");
+        let (id, s0, e0, n) = got[0];
+        // The end is the beat seen at the next poll (10 ms).
+        assert_eq!((id, s0, n), (1, start, 7));
+        assert!((end..=end + 10).contains(&e0), "{got:?}");
+    }
+
+    #[test]
+    fn a_user_pause_splits() {
+        // Two busy parts with a 1 s pause of an idle UI (the run loop
+        // sleeps) between them.
+        let got = closes(&replay(&[(1_000, 2_000), (3_000, 4_000)], true));
+        assert_eq!(got, [(1, 1_000, 2_000, 1), (2, 3_000, 4_000, 1)]);
+        // The same pause, the UI awake (beats, no sleep): also two.
+        let got = closes(&replay(&[(1_000, 2_000), (3_000, 4_000)], false));
+        assert_eq!(got, [(1, 1_000, 2_000, 1), (2, 3_000, 4_000, 1)]);
+    }
+
     #[test]
     fn a_gap_longer_than_join_makes_two_freezes() {
         // Stall 1_000..1_500, beats every 10 ms to 1_600, stall 1_600..2_100.
         let mut beats: Vec<u64> = (0..=1_000).step_by(10).collect();
         beats.extend((1_500..=1_600).step_by(10));
         beats.extend((2_100..=2_500).step_by(10));
-        let out = join_run(&beats, 10_000, 3_000);
+        let out = join_run_with(50, &beats, 10_000, 3_000);
         let closes: Vec<_> = out
             .iter()
             .filter_map(|o| match o {
@@ -590,11 +702,11 @@ mod tests {
     }
 
     #[test]
-    fn a_real_sleep_closes_at_once() {
+    fn a_real_sleep_closes_after_join() {
         let beats: Vec<u64> = (0..=1_000).step_by(10).collect();
         // Busy 1_000..1_600, then the run loop sleeps.
         let mut d = StallDetector::new(250);
-        let mut j = Joiner::new(50, 250, 10, 1000);
+        let mut j = Joiner::new(JOIN_MS, 250, 10, 1000);
         let mut closed_at = None;
         for t in (0..=2_000).step_by(10) {
             let beat = beats.iter().copied().filter(|b| *b <= t).max().unwrap_or(0);
@@ -606,8 +718,27 @@ mod tests {
                 }
             }
         }
-        assert_eq!(closed_at, Some((1_600, 1_600)));
+        assert_eq!(closed_at, Some((1_600 + JOIN_MS, 1_600)));
         assert!(!j.is_open());
+    }
+
+    #[test]
+    fn with_join_0_a_real_sleep_closes_at_once() {
+        let beats: Vec<u64> = (0..=1_000).step_by(10).collect();
+        let mut d = StallDetector::new(250);
+        let mut j = Joiner::new(0, 250, 10, 1000);
+        let mut closed_at = None;
+        for t in (0..=2_000).step_by(10) {
+            let beat = beats.iter().copied().filter(|b| *b <= t).max().unwrap_or(0);
+            let waiting = t >= 1_600;
+            let tr = d.observe(s(t, beat, waiting));
+            for o in j.step(t * MS, tr, waiting) {
+                if let JoinOut::Close { .. } = o {
+                    closed_at = Some(t);
+                }
+            }
+        }
+        assert_eq!(closed_at, Some(1_600));
     }
 
     #[test]

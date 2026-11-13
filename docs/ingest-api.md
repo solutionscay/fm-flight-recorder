@@ -149,8 +149,10 @@ uses the defaults.
 ### Long freezes: one event that grows
 
 FileMaker can run the run loop for a moment in a long operation (about once a second in a long
-script step). The plug-in joins these parts into one freeze: a part that starts at most 50 ms
-after the end of the last part, with no real sleep between, is the same freeze.
+script step, or between the steps of a long script). The plug-in joins these parts into one
+freeze: a part that starts at most 300 ms after the end of the last part is the same freeze
+(`join_ms=`, 0 to 1000). A sleep of the run loop that is shorter than this does not split the
+freeze; a longer sleep (an idle UI) closes it.
 
 While a freeze lasts, the plug-in sends a `freeze_progress` event about once a second, after
 the first second. The option `progress_ms=` changes the interval: 250 to 30000 ms, or 0 for
@@ -167,8 +169,9 @@ the interval stays well inside that.
 | `level`, `before` | As in `freeze`. |
 | `parts` | The parts joined so far. |
 
-When the freeze ends, the plug-in sends the usual `freeze` event. Its `ts` is the same text as
-the `ts` of the `freeze_progress` events of that freeze. A server that knows `freeze_progress`
+When the freeze ends, the plug-in sends the usual `freeze` event, with `parts` (the parts
+joined; an older plug-in leaves it out). Its `ts` is the same text as the `ts` of the
+`freeze_progress` events of that freeze. A server that knows `freeze_progress`
 shows one open freeze that grows, and the final `freeze` replaces it. An older server keeps
 the `freeze_progress` events as unknown events, and stores the final `freeze` as before.
 

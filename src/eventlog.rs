@@ -55,6 +55,10 @@ pub enum Event {
         /// FlightRecorder_Mark labels set during or just before the freeze.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         marks: Vec<String>,
+        /// Parts joined into this freeze (see `freeze_progress`). 0 = not
+        /// known (an older plug-in).
+        #[serde(default, skip_serializing_if = "is_zero")]
+        parts: u32,
     },
     /// A freeze that still lasts. The plug-in sends one about once a second
     /// while a long freeze lasts. `ts` is the start of the freeze. The final
@@ -103,6 +107,10 @@ struct Line<'a> {
     v: u32,
     #[serde(flatten)]
     event: &'a Event,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 pub fn to_line(e: &Event) -> String {
@@ -315,6 +323,7 @@ mod tests {
                 ..Default::default()
             },
             marks: vec!["load invoice".into()],
+            parts: 3,
         };
         let line = to_line(&e);
         assert!(line.starts_with("{\"v\":1,\"type\":\"freeze\""), "{line}");
